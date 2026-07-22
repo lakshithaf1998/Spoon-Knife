@@ -1,1 +1,2 @@
 Trigger temporary LakWatch creature asset build.
+Retry with simplified ASA render selection.
