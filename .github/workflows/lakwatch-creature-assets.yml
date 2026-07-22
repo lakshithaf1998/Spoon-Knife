@@ -1,0 +1,170 @@
+name: Build LakWatch creature assets
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lakwatch-creature-assets.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build creature asset pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pillow
+          git clone --depth 1 https://github.com/arkutils/species-images.git species-images
+          cat > /tmp/build_assets.py <<'PY'
+          import json, re, shutil, unicodedata, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          OUT=Path('lakwatch_creature_assets')
+          IMGOUT=OUT/'images'
+          IMGOUT.mkdir(parents=True, exist_ok=True)
+          SRC=Path('species-images/images')
+          S=requests.Session(); S.headers['User-Agent']='LakWatchAssetBuilder/1.0'
+
+          # Current ASA creature index. We use Dododex only as a discovery/index page,
+          # never as an image source. Each selected creature is then matched to ark.wiki.gg.
+          url='https://www.dododex.com/dinosaurs/ark-survival-ascended'
+          html=S.get(url, timeout=45).text
+          soup=BeautifulSoup(html,'html.parser')
+          names=[]
+          # Prefer the list following the ASA heading.
+          heading=None
+          for h in soup.find_all(['h1','h2','h3']):
+              if 'ARK: Survival Ascended' in h.get_text(' ',strip=True):
+                  heading=h; break
+          if heading:
+              node=heading
+              for _ in range(30):
+                  node=node.find_next()
+                  if node is None: break
+                  if node.name=='ul':
+                      vals=[li.get_text(' ',strip=True) for li in node.find_all('li', recursive=False)]
+                      if len(vals)>30:
+                          names=vals; break
+          # Fallback: extract creature links between the ASA heading and next major section.
+          if not names:
+              text=soup.get_text('\n')
+              # Known page exposes creature names as links; collect likely links in main content.
+              for a in soup.find_all('a'):
+                  t=a.get_text(' ',strip=True)
+                  href=a.get('href','')
+                  if t and ('/taming/' in href or '/dinosaurs/' in href) and len(t)<80:
+                      names.append(t)
+          # De-dupe and remove explicitly marked mods.
+          clean=[]; seen=set()
+          for n in names:
+              n=re.sub(r'\s+',' ',n).strip()
+              if not n or '[MOD]' in n.upper(): continue
+              if n.lower() in {'ark: survival ascended','creatures','more'}: continue
+              if n not in seen: seen.add(n); clean.append(n)
+          names=clean
+          if len(names)<100:
+              raise RuntimeError(f'Creature index parse returned only {len(names)} names')
+
+          def norm(s):
+              s=unicodedata.normalize('NFKD',s).encode('ascii','ignore').decode().lower()
+              s=s.replace('&','and')
+              return re.sub(r'[^a-z0-9]+','',s)
+
+          aliases={
+            'angler':'Anglerfish','spinosaurus':'Spino','therizinosaurus':'Therizinosaur',
+            'reaper':'Reaper King','minotaur':'Minotarchos','hydrascos':'Hydraskos the Unbroken',
+            'hydrascos the unbroken':'Hydraskos the Unbroken','murder turkey':'Murder Turkey',
+          }
+
+          # Index render files. Prefer ASA-specific, base-sex-neutral, non-mask, non-variant art.
+          files=list(SRC.glob('*.png'))
+          index={}
+          for p in files:
+              stem=p.stem
+              if stem.endswith('_m'): continue
+              score=0
+              base=stem
+              if '_ASA' in stem: score+=100
+              if re.search(r'_v\d+$',stem): score-=20
+              if re.search(r'_p\d+$',stem): score-=20
+              if re.search(r'_s[fm]$',stem): score-=20
+              base=re.sub(r'_ASA(?:_s[fm])?(?:_p\d+)?(?:_v\d+)?$','',base)
+              key=norm(base)
+              if key not in index or score>index[key][0]: index[key]=(score,p,base)
+
+          # Explicit expansions where a list uses an umbrella entry but the game has distinct creatures.
+          expansions={
+            'Wyvern':['Fire Wyvern','Lightning Wyvern','Poison Wyvern','Ice Wyvern'],
+            'Titanomyrma':['Titanomyrma Drone','Titanomyrma Soldier'],
+            'Jug Bug':['Oil Jug Bug','Water Jug Bug'],
+            'Reaper':['Reaper King','Reaper Queen'],
+            'Drakeling':['Drakeling (Spring)','Drakeling (Summer)','Drakeling (Autumn)','Drakeling (Winter)'],
+          }
+          expanded=[]
+          for n in names:
+              expanded.extend(expansions.get(n,[n]))
+          names=[]; seen=set()
+          for n in expanded:
+              if n not in seen: seen.add(n); names.append(n)
+
+          manifest=[]; missing=[]
+          for display in names:
+              lookup=aliases.get(display.lower(),display)
+              candidates=[lookup,display]
+              hit=None
+              for c in candidates:
+                  if norm(c) in index:
+                      hit=index[norm(c)][1]; break
+              # Wiki match/verification URL (page may redirect; preserve final URL)
+              wiki='https://ark.wiki.gg/wiki/'+urllib.parse.quote(display.replace(' ','_'),safe='()_-')
+              wiki_ok=False; final_wiki=wiki
+              try:
+                  r=S.get(wiki,timeout=20,allow_redirects=True)
+                  wiki_ok=(r.status_code==200 and 'There is currently no text in this page' not in r.text)
+                  final_wiki=r.url
+              except Exception:
+                  pass
+              if not hit:
+                  missing.append({'name':display,'wiki':final_wiki,'wiki_ok':wiki_ok})
+                  continue
+              im=Image.open(hit).convert('RGBA')
+              # Contain in a transparent 512x512 square; do not crop creature extremities.
+              im.thumbnail((492,492),Image.Resampling.LANCZOS)
+              canvas=Image.new('RGBA',(512,512),(0,0,0,0))
+              canvas.alpha_composite(im,((512-im.width)//2,(512-im.height)//2))
+              fname=re.sub(r'[^a-z0-9]+','_',display.lower()).strip('_')+'.webp'
+              dest=IMGOUT/fname
+              canvas.save(dest,'WEBP',lossless=True,method=6)
+              manifest.append({
+                'name':display,'file':'images/'+fname,
+                'wiki_url':final_wiki,'wiki_matched':wiki_ok,
+                'source_render_file':hit.name,
+                'render_source':'arkutils/species-images (MIT)'
+              })
+
+          # Add README + manifest. Missing list makes gaps explicit instead of silently substituting screenshots/dossiers.
+          (OUT/'creature_manifest.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')
+          (OUT/'missing_creatures.json').write_text(json.dumps(missing,indent=2,ensure_ascii=False),encoding='utf-8')
+          (OUT/'ATTRIBUTION.md').write_text('''# LakWatch Creature Assets\n\nCreature roster indexed from the current ARK: Survival Ascended creature listing and matched against the ARK Official Community Wiki (`ark.wiki.gg`).\n\nClean creature renders are sourced from `arkutils/species-images`, whose README states contributed images are available under the MIT License. We deliberately prefer clean species renders and do not substitute dossier pages or gameplay screenshots when a clean render is unavailable.\n\nAll packaged images are normalized to 512×512 lossless WebP with transparent padding and no destructive crop.\n''',encoding='utf-8')
+          (OUT/'build_summary.json').write_text(json.dumps({'indexed':len(names),'packaged':len(manifest),'missing':len(missing)},indent=2),encoding='utf-8')
+          print(json.dumps({'indexed':len(names),'packaged':len(manifest),'missing':len(missing)},indent=2))
+          if len(manifest)<100:
+              raise RuntimeError('Too few packaged assets; aborting')
+          shutil.make_archive('lakwatch_creature_assets','zip',OUT)
+          PY
+          python /tmp/build_assets.py
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: lakwatch_creature_assets
+          path: lakwatch_creature_assets.zip
+          if-no-files-found: error
+          retention-days: 1
