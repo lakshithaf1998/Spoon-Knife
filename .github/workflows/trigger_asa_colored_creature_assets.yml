@@ -1,0 +1,36 @@
+name: Trigger ASA Colored Creature Assets
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install launcher dependency
+        run: python -m pip install --disable-pip-version-check pyyaml
+      - name: Execute asset builder from canonical workflow
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess, yaml
+          from pathlib import Path
+          p = Path('.github/workflows/build_asa_colored_creature_assets.yml')
+          data = yaml.safe_load(p.read_text())
+          steps = data['jobs']['build']['steps']
+          run_step = next(s for s in steps if s.get('name') == 'Build colored ASA creature pack')
+          subprocess.run(['bash', '-lc', run_step['run']], check=True)
+          PY
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: lakwatch-creature-assets-colored
+          path: lakwatch_creature_assets_colored.zip
+          if-no-files-found: error
+          retention-days: 1
