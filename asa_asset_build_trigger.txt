@@ -1,1 +1,2 @@
 Trigger the temporary ASA colored creature asset build.
+Retry after installing Pillow and requests.
